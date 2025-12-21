@@ -1,6 +1,4 @@
-[functions]
-  directory = "netlify/functions"
-
 [build]
-  command = "npm install"
-  publish = "public"
+  command = "echo \"no build\""
+  publish = "."
+  functions = "functions"
