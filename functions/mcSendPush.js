@@ -1,120 +1,100 @@
-// functions/mcSendPush.js
+// netlify/functions/mcSendPush.js
 const admin = require("firebase-admin");
 
-function corsHeaders(origin) {
-  return {
-    "Access-Control-Allow-Origin": origin || "*",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "POST, OPTIONS"
-  };
+function readToken(event) {
+  const h = event.headers || {};
+  const auth = h.authorization || h.Authorization || "";
+  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  return (
+    h["x-token"] ||
+    h["X-Token"] ||
+    h["x-api-key"] ||
+    h["X-Api-Key"] ||
+    ""
+  ).trim();
 }
 
-function json(statusCode, headers, obj) {
-  return {
-    statusCode,
-    headers,
-    body: JSON.stringify(obj)
-  };
+function json(res) {
+  return JSON.stringify(res);
 }
 
-function getServiceAccountFromEnv() {
-  // Du skal sætte denne på Netlify:
-  // FIREBASE_SERVICE_ACCOUNT_JSON = (hele JSON'en fra Firebase service account key)
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) return null;
-
-  try {
-    // Netlify env kan indeholde JSON direkte (med { } osv.)
-    return JSON.parse(raw);
-  } catch (e) {
-    // Hvis du har gemt den som en string med escaped \n, prøv at normalisere
-    try {
-      const normalized = raw.replace(/\\n/g, "\n");
-      return JSON.parse(normalized);
-    } catch (e2) {
-      return null;
-    }
-  }
-}
-
-function ensureFirebaseAdmin() {
+function ensureFirebase() {
   if (admin.apps.length) return;
 
-  const sa = getServiceAccountFromEnv();
-  if (!sa) {
-    throw new Error(
-      "Missing FIREBASE_SERVICE_ACCOUNT_JSON env var (Firebase service account key JSON)."
-    );
-  }
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY;
+
+  if (!projectId) throw new Error("Missing FIREBASE_PROJECT_ID env var.");
+  if (!clientEmail) throw new Error("Missing FIREBASE_CLIENT_EMAIL env var.");
+  if (!privateKeyRaw) throw new Error("Missing FIREBASE_PRIVATE_KEY env var.");
+
+  // Netlify env vars often store \n literally
+  const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
 
   admin.initializeApp({
-    credential: admin.credential.cert(sa)
+    credential: admin.credential.cert({
+      projectId,
+      clientEmail,
+      privateKey,
+    }),
   });
 }
 
 exports.handler = async (event) => {
-  const headers = corsHeaders(process.env.ALLOWED_ORIGIN || "*");
-
-  // Preflight
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers, body: "" };
-  }
-
-  if (event.httpMethod !== "POST") {
-    return json(405, headers, { error: "Use POST" });
-  }
-
-  let body;
   try {
-    body = event.body ? JSON.parse(event.body) : {};
-  } catch (e) {
-    return json(400, headers, { error: "Invalid JSON body" });
-  }
+    // CORS
+    if (event.httpMethod === "OPTIONS") {
+      return {
+        statusCode: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, x-token, x-api-key",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+        },
+        body: "",
+      };
+    }
 
-  const token = (body.token || "").trim();
-  const type = (body.type || "").trim();
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, body: json({ ok: false, error: "Use POST" }) };
+    }
 
-  // notification kan være valgfri, men vi støtter title/body for test
-  const title = (body.title || "MinCirkel").toString();
-  const msgBody = (body.body || "").toString();
+    // Auth token for this endpoint
+    const expected = process.env.MC_SENDPUSH_TOKEN;
+    if (!expected) {
+      return { statusCode: 500, body: json({ ok: false, error: "Missing MC_SENDPUSH_TOKEN env var." }) };
+    }
+    const got = readToken(event);
+    if (!got) return { statusCode: 400, body: json({ ok: false, error: "Missing token" }) };
+    if (got !== expected) return { statusCode: 401, body: json({ ok: false, error: "Invalid token" }) };
 
-  const conversationId = (body.conversationId || "").toString();
-  const callId = (body.callId || "").toString();
+    const body = JSON.parse(event.body || "{}");
 
-  if (!token) return json(400, headers, { error: "Missing token" });
-  if (!type) return json(400, headers, { error: "Missing type" });
+    const type = body.type;
+    const to = body.to || body.deviceToken;
+    const data = body.data || {};
 
-  try {
-    ensureFirebaseAdmin();
+    if (!type) return { statusCode: 400, body: json({ ok: false, error: "Missing type" }) };
+    if (!to) return { statusCode: 400, body: json({ ok: false, error: "Missing to" }) };
 
-    // ✅ Matcher din Android MainActivity.handleIntent(...) der læser:
-    // mc_push_type, mc_push_conversationId, mc_push_callId
+    ensureFirebase();
+
+    // Send as data message (best for call flows)
     const message = {
-      token,
-      notification: {
-        title,
-        body: msgBody
-      },
+      token: to,
       data: {
-        mc_push_type: type,
-        mc_push_conversationId: conversationId,
-        mc_push_callId: callId
+        type: String(type),
+        ...(Object.fromEntries(
+          Object.entries(data).map(([k, v]) => [String(k), String(v)])
+        )),
       },
-      android: {
-        priority: "high"
-      }
     };
 
-    const messageId = await admin.messaging().send(message);
+    const msgId = await admin.messaging().send(message);
 
-    return json(200, headers, {
-      ok: true,
-      messageId
-    });
-  } catch (err) {
-    return json(500, headers, {
-      ok: false,
-      error: err && err.message ? err.message : String(err)
-    });
+    return { statusCode: 200, body: json({ ok: true, messageId: msgId }) };
+  } catch (e) {
+    return { statusCode: 500, body: json({ ok: false, error: e.message || String(e) }) };
   }
 };
