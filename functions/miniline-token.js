@@ -1,27 +1,40 @@
 const { AccessToken } = require("livekit-server-sdk");
 
-function corsHeaders(origin) {
+function buildCorsHeaders(requestOrigin) {
+  // Hvis du vil låse den til ét domæne:
+  // Sæt env: ALLOWED_ORIGIN=https://native-bridge-private.netlify.app
+  const allowed = process.env.ALLOWED_ORIGIN || "*";
+
+  // Hvis allowed er "*" så svar med "*".
+  // Hvis allowed er en specifik origin, så brug den.
+  // (Du kan også vælge at spejle requestOrigin, men vi holder den enkel og stabil.)
+  const allowOrigin = allowed === "*" ? "*" : allowed;
+
   return {
-    "Access-Control-Allow-Origin": origin || "*",
+    "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "POST, OPTIONS"
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
   };
 }
 
 exports.handler = async (event) => {
-  const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
-  const headers = corsHeaders(allowedOrigin);
+  const requestOrigin =
+    (event.headers && (event.headers.origin || event.headers.Origin)) || "";
 
-  // Preflight
+  const headers = buildCorsHeaders(requestOrigin);
+
+  // Preflight (CORS)
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers, body: "" };
+    return { statusCode: 200, headers, body: "" };
   }
 
   if (event.httpMethod !== "POST") {
     return {
       statusCode: 405,
       headers,
-      body: JSON.stringify({ error: "Use POST" })
+      body: JSON.stringify({ ok: false, error: "Use POST" }),
     };
   }
 
@@ -34,8 +47,10 @@ exports.handler = async (event) => {
       statusCode: 500,
       headers,
       body: JSON.stringify({
-        error: "Missing env vars: LIVEKIT_API_KEY / LIVEKIT_API_SECRET / LIVEKIT_URL"
-      })
+        ok: false,
+        error:
+          "Missing env vars: LIVEKIT_API_KEY / LIVEKIT_API_SECRET / LIVEKIT_URL",
+      }),
     };
   }
 
@@ -46,7 +61,7 @@ exports.handler = async (event) => {
     return {
       statusCode: 400,
       headers,
-      body: JSON.stringify({ error: "Bad JSON" })
+      body: JSON.stringify({ ok: false, error: "Bad JSON" }),
     };
   }
 
@@ -58,38 +73,47 @@ exports.handler = async (event) => {
     return {
       statusCode: 400,
       headers,
-      body: JSON.stringify({ error: "Missing fields: room, identity" })
+      body: JSON.stringify({
+        ok: false,
+        error: "Missing fields: room, identity",
+      }),
     };
   }
 
   try {
     const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
       identity,
-      name
+      name,
     });
 
     at.addGrant({
       roomJoin: true,
       room,
       canPublish: true,
-      canSubscribe: true
+      canSubscribe: true,
     });
 
     const token = await at.toJwt();
 
+    // ✅ VIGTIGT: demoen forventer { url, token }
     return {
       statusCode: 200,
       headers,
       body: JSON.stringify({
-        serverUrl: LIVEKIT_URL,
-        token
-      })
+        ok: true,
+        url: LIVEKIT_URL,
+        token,
+      }),
     };
   } catch (e) {
     return {
       statusCode: 500,
       headers,
-      body: JSON.stringify({ error: "Token error", details: String(e?.message || e) })
+      body: JSON.stringify({
+        ok: false,
+        error: "Token error",
+        details: String((e && e.message) || e),
+      }),
     };
   }
 };
